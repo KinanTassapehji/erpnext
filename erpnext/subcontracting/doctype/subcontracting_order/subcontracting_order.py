@@ -88,23 +88,6 @@ class SubcontractingOrder(SubcontractingController):
 		transaction_date: DF.Date
 	# end: auto-generated types
 
-	def __init__(self, *args, **kwargs):
-		super().__init__(*args, **kwargs)
-
-		self.status_updater = [
-			{
-				"source_dt": "Subcontracting Order Item",
-				"target_dt": "Material Request Item",
-				"join_field": "material_request_item",
-				"target_field": "ordered_qty",
-				"target_parent_dt": "Material Request",
-				"target_parent_field": "per_ordered",
-				"target_ref_field": "stock_qty",
-				"source_field": "qty",
-				"percent_join_field": "material_request",
-			}
-		]
-
 	def onload(self):
 		self.set_onload(
 			"over_transfer_allowance",
@@ -139,13 +122,11 @@ class SubcontractingOrder(SubcontractingController):
 		self.reset_default_field_value("set_warehouse", "items", "warehouse")
 
 	def on_submit(self):
-		self.update_prevdoc_status()
 		self.update_status()
 		self.update_subcontracted_quantity_in_po()
 		self.reserve_raw_materials()
 
 	def on_cancel(self):
-		self.update_prevdoc_status()
 		self.update_status()
 		self.update_subcontracted_quantity_in_po(cancel=True)
 
@@ -458,6 +439,13 @@ def get_mapped_subcontracting_receipt(source_name, target_doc=None, items=None):
 		target.purchase_order = source_parent.purchase_order
 		target.purchase_order_item = source.purchase_order_item
 		target.qty = items.get(source.name) or (flt(source.qty) - flt(source.received_qty))
+		target.received_qty = target.qty
+		if process_loss_per := frappe.get_value("BOM", source.bom, "process_loss_percentage"):
+			target.process_loss_qty = flt(
+				target.qty * (process_loss_per / 100), target.precision("process_loss_qty")
+			)
+			target.qty -= target.process_loss_qty
+
 		target.amount = (flt(source.qty) - flt(source.received_qty)) * flt(source.rate)
 
 	items = {item["name"]: item["qty"] for item in items} if items else {}

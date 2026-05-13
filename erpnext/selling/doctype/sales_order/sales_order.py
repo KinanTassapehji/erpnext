@@ -27,6 +27,7 @@ from erpnext.manufacturing.doctype.blanket_order.blanket_order import (
 )
 from erpnext.manufacturing.doctype.production_plan.production_plan import (
 	get_items_for_material_requests,
+	get_sales_orders,
 )
 from erpnext.selling.doctype.customer.customer import check_credit_limit
 from erpnext.setup.doctype.item_group.item_group import get_item_group_defaults
@@ -116,6 +117,7 @@ class SalesOrder(SellingController):
 		grand_total: DF.Currency
 		group_same_items: DF.Check
 		has_unit_price_items: DF.Check
+		ignore_default_payment_terms_template: DF.Check
 		ignore_pricing_rule: DF.Check
 		in_words: DF.Data | None
 		incoterm: DF.Link | None
@@ -179,6 +181,7 @@ class SalesOrder(SellingController):
 		tc_name: DF.Link | None
 		terms: DF.TextEditor | None
 		territory: DF.Link | None
+		title: DF.Data | None
 		to_date: DF.Date | None
 		total: DF.Currency
 		total_commission: DF.Currency
@@ -186,6 +189,7 @@ class SalesOrder(SellingController):
 		total_qty: DF.Float
 		total_taxes_and_charges: DF.Currency
 		transaction_date: DF.Date
+		transaction_time: DF.Time | None
 		utm_campaign: DF.Link | None
 		utm_content: DF.Data | None
 		utm_medium: DF.Link | None
@@ -530,7 +534,7 @@ class SalesOrder(SellingController):
 			"Unreconcile Payment Entries",
 		)
 		super().on_cancel()
-
+		super().update_prevdoc_status()
 		# Cannot cancel closed SO
 		if self.status == "Closed":
 			frappe.throw(_("Closed order cannot be cancelled. Unclose to cancel."))
@@ -606,6 +610,7 @@ class SalesOrder(SellingController):
 		self.update_subcontracting_order_status()
 		self.notify_update()
 		clear_doctype_notifications(self)
+		self.update_blanket_order()
 
 	def update_subcontracting_order_status(self):
 		from erpnext.subcontracting.doctype.subcontracting_inward_order.subcontracting_inward_order import (
@@ -1001,20 +1006,19 @@ def close_or_unclose_sales_orders(names, status):
 
 def get_requested_item_qty(sales_order):
 	result = {}
-	for d in frappe.db.get_all(
-		"Material Request Item",
-		filters={"docstatus": 1, "sales_order": sales_order},
-		fields=[
-			"sales_order_item",
-			"packed_item",
-			{"SUM": "qty", "as": "qty"},
-			{"SUM": "received_qty", "as": "received_qty"},
-		],
-		group_by="sales_order_item, packed_item",
-	):
-		result[d.sales_order_item or d.packed_item] = frappe._dict(
-			{"qty": d.qty, "received_qty": d.received_qty}
-		)
+
+	so = frappe.get_doc("Sales Order", sales_order)
+
+	for item in so.items:
+		if is_product_bundle(item.item_code):
+			for packed_item in so.get("packed_items"):
+				if (
+					packed_item.parent_item == item.item_code
+					and packed_item.parent_detail_docname == item.name
+				):
+					result[packed_item.name] = frappe._dict({"qty": packed_item.requested_qty})
+		else:
+			result[item.name] = frappe._dict({"qty": item.requested_qty})
 
 	return result
 
@@ -1033,8 +1037,7 @@ def make_material_request(source_name, target_doc=None):
 			flt(so_item.qty)
 			- flt(requested_item_qty.get(so_item.name, {}).get("qty"))
 			- max(
-				flt(so_item.get("delivered_qty"))
-				- flt(requested_item_qty.get(so_item.name, {}).get("received_qty")),
+				flt(so_item.get("delivered_qty")),
 				0,
 			)
 		)
@@ -1049,16 +1052,12 @@ def make_material_request(source_name, target_doc=None):
 		)
 
 		return flt(
-			(
-				flt(so_item.qty)
-				- flt(requested_item_qty.get(so_item.name, {}).get("qty"))
-				- max(
-					flt(delivered_qty) * flt(bundle_item_qty)
-					- flt(requested_item_qty.get(so_item.name, {}).get("received_qty")),
-					0,
-				)
+			flt(so_item.qty)
+			- flt(requested_item_qty.get(so_item.name, {}).get("qty"))
+			- max(
+				flt(delivered_qty) * flt(bundle_item_qty),
+				0,
 			)
-			* bundle_item_qty
 		)
 
 	def update_item(source, target, source_parent):
@@ -1120,8 +1119,10 @@ def make_material_request(source_name, target_doc=None):
 		target_doc,
 		postprocess,
 	)
-
-	return doc
+	if doc and doc.items:
+		return doc
+	else:
+		frappe.throw(_("Material Request already created for the ordered quantity"))
 
 
 @frappe.whitelist()
@@ -1627,7 +1628,7 @@ def make_purchase_order(source_name, selected_items=None, target_doc=None):
 		if default_payment_terms:
 			target.payment_terms_template = default_payment_terms
 
-		if any(item.delivered_by_supplier == 1 for item in source.items):
+		if any(item.delivered_by_supplier for item in target.items):
 			if source.shipping_address_name:
 				target.shipping_address = source.shipping_address_name
 				target.shipping_address_display = source.shipping_address
@@ -1803,9 +1804,39 @@ def make_work_orders(items, sales_order, company, project=None):
 	return [p.name for p in out]
 
 
+def make_production_plan(source_name, target_doc=None):
+	sales_order = frappe.get_doc("Sales Order", source_name)
+
+	production_plan = frappe.new_doc(
+		"Production Plan",
+		company=sales_order.company,
+		get_items_from="Sales Order",
+		posting_date=nowdate(),
+	)
+
+	open_so = [data.name for data in get_sales_orders(production_plan)]
+	if sales_order.name not in open_so:
+		frappe.throw(_("Sales Order {0} is not available for production").format(sales_order.name))
+
+	production_plan.append(
+		"sales_orders",
+		{
+			"sales_order": sales_order.name,
+			"sales_order_date": sales_order.transaction_date,
+			"customer": sales_order.customer,
+			"grand_total": sales_order.base_grand_total,
+		},
+	)
+	production_plan.get_items()
+	if not production_plan.get("po_items"):
+		frappe.throw(_("Sales Order {0} is not available for production").format(sales_order.name))
+
+	return production_plan
+
+
 @frappe.whitelist()
 def update_status(status, name):
-	so = frappe.get_doc("Sales Order", name)
+	so = frappe.get_doc("Sales Order", name, check_permission="submit")
 	so.update_status(status)
 
 
@@ -2021,14 +2052,14 @@ def get_work_order_items(sales_order, for_raw_material_request=0):
 				if not pending_qty:
 					pending_qty = stock_qty * overproduction_percentage_for_sales_order
 
-				if pending_qty > 0 and i.item_code not in product_bundle_parents:
+				if pending_qty > 0 and i.item_code not in product_bundle_parents and bom:
 					items.append(
 						dict(
 							name=i.name,
 							item_code=i.item_code,
 							item_name=i.item_name,
 							description=i.description,
-							bom=bom or "",
+							bom=bom,
 							warehouse=i.warehouse,
 							pending_qty=pending_qty,
 							required_qty=pending_qty if for_raw_material_request else 0,

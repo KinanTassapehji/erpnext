@@ -159,13 +159,14 @@ class PurchaseOrder(BuyingController):
 		taxes_and_charges_deducted: DF.Currency
 		tc_name: DF.Link | None
 		terms: DF.TextEditor | None
-		title: DF.Data
+		title: DF.Data | None
 		to_date: DF.Date | None
 		total: DF.Currency
 		total_net_weight: DF.Float
 		total_qty: DF.Float
 		total_taxes_and_charges: DF.Currency
 		transaction_date: DF.Date
+		transaction_time: DF.Time | None
 	# end: auto-generated types
 
 	def __init__(self, *args, **kwargs):
@@ -191,6 +192,9 @@ class PurchaseOrder(BuyingController):
 		self.set_has_unit_price_items()
 		self.flags.allow_zero_qty = self.has_unit_price_items
 
+		if self.is_subcontracted:
+			self.status_updater[0]["source_field"] = "fg_item_qty"
+
 	def validate(self):
 		super().validate()
 
@@ -214,7 +218,6 @@ class PurchaseOrder(BuyingController):
 			self.create_raw_materials_supplied()
 
 		self.validate_fg_item_for_subcontracting()
-		self.set_received_qty_for_drop_ship_items()
 
 		if not self.advance_payment_status:
 			self.advance_payment_status = "Not Initiated"
@@ -489,6 +492,8 @@ class PurchaseOrder(BuyingController):
 
 		if self.has_drop_ship_item():
 			self.update_delivered_qty_in_sales_order()
+			self.set_received_qty_to_zero_for_drop_ship_items()
+			self.update_receiving_percentage()
 
 		self.update_reserved_qty_for_subcontract()
 		self.check_on_hold_or_closed_status()
@@ -562,19 +567,71 @@ class PurchaseOrder(BuyingController):
 			so.set_status(update=True)
 			so.notify_update()
 
+	def set_received_qty_to_zero_for_drop_ship_items(self):
+		for item in self.items:
+			if item.delivered_by_supplier:
+				item.db_set("received_qty", 0)
+
 	def has_drop_ship_item(self):
 		return any(d.delivered_by_supplier for d in self.items)
+
+	@frappe.whitelist()
+	def update_dropship_received_qty(self, data: list[dict]):
+		if not data:
+			frappe.throw(_("Please select at least one item to update delivered quantity."))
+
+		for d in data:
+			item = next((item for item in self.items if item.name == d.get("name")), None)
+
+			if not item:
+				frappe.throw(
+					_("Item with name {0} not found in the Purchase Order").format(frappe.bold(d.get("name")))
+				)
+
+			if not item.delivered_by_supplier:
+				frappe.throw(
+					_(
+						"Item {0} is not a drop ship item. Only drop ship items can have Delivered Qty updated."
+					).format(frappe.bold(item.item_code))
+				)
+
+			if not item.has_permlevel_access_to("received_qty", permission_type="write"):
+				frappe.throw(
+					_("You don't have permission to update Received Qty DocField for item {0}").format(
+						frappe.bold(item.item_code)
+					)
+				)
+
+			if not d.get("qty_change"):
+				frappe.throw(
+					_(
+						"Item {0} has no changes in delivered quantity. Please unselect the row if you do not wish to update its quantity."
+					).format(frappe.bold(item.item_code))
+				)
+
+			if d.get("qty_change") < 0 and abs(d.get("qty_change")) > item.received_qty:
+				frappe.throw(
+					_("Delivered Qty cannot be reduced by more than {0} for item {1}").format(
+						item.received_qty, frappe.bold(item.item_code)
+					)
+				)
+
+			if d.get("qty_change") > 0 and item.received_qty + d.get("qty_change") > item.qty:
+				frappe.throw(
+					_("Delivered Qty cannot be increased by more than {0} for item {1}").format(
+						item.qty - item.received_qty, frappe.bold(item.item_code)
+					)
+				)
+
+			item.received_qty += d.get("qty_change")
+		self.update_receiving_percentage()
+		self.save()
 
 	def is_against_so(self):
 		return any(d.sales_order for d in self.items if d.sales_order)
 
 	def is_against_pp(self):
 		return any(d.production_plan for d in self.items if d.production_plan)
-
-	def set_received_qty_for_drop_ship_items(self):
-		for item in self.items:
-			if item.delivered_by_supplier == 1:
-				item.received_qty = item.qty
 
 	def update_reserved_qty_for_subcontract(self):
 		if self.is_old_subcontracting_flow:
@@ -588,7 +645,7 @@ class PurchaseOrder(BuyingController):
 		for item in self.items:
 			received_qty += min(item.received_qty, item.qty)
 			total_qty += item.qty
-		if total_qty:
+		if total_qty and received_qty:
 			self.db_set("per_received", flt(received_qty / total_qty) * 100, update_modified=False)
 		else:
 			self.db_set("per_received", 0, update_modified=False)
@@ -776,7 +833,8 @@ def make_purchase_invoice_from_portal(purchase_order_name):
 	if frappe.session.user not in frappe.get_all("Portal User", {"parent": doc.supplier}, pluck="user"):
 		frappe.throw(_("Not Permitted"), frappe.PermissionError)
 	doc.save()
-	frappe.db.commit()
+	if not frappe.in_test:
+		frappe.db.commit()
 	frappe.response["type"] = "redirect"
 	frappe.response.location = "/purchase-invoices/" + doc.name
 
@@ -798,18 +856,18 @@ def get_mapped_purchase_invoice(source_name, target_doc=None, ignore_permissions
 		target.set_payment_schedule()
 		target.credit_to = get_party_account("Supplier", source.supplier, source.company)
 
+	def get_billed_qty(po_item_name):
+		from frappe.query_builder.functions import Sum
+
+		table = frappe.qb.DocType("Purchase Invoice Item")
+		query = (
+			frappe.qb.from_(table)
+			.select(Sum(table.qty).as_("qty"))
+			.where((table.docstatus == 1) & (table.po_detail == po_item_name))
+		)
+		return query.run(pluck="qty")[0] or 0
+
 	def update_item(obj, target, source_parent):
-		def get_billed_qty(po_item_name):
-			from frappe.query_builder.functions import Sum
-
-			table = frappe.qb.DocType("Purchase Invoice Item")
-			query = (
-				frappe.qb.from_(table)
-				.select(Sum(table.qty).as_("qty"))
-				.where((table.docstatus == 1) & (table.po_detail == po_item_name))
-			)
-			return query.run(pluck="qty")[0] or 0
-
 		billed_qty = flt(get_billed_qty(obj.name))
 		target.qty = flt(obj.qty) - billed_qty
 
@@ -849,7 +907,11 @@ def get_mapped_purchase_invoice(source_name, target_doc=None, ignore_permissions
 				"wip_composite_asset": "wip_composite_asset",
 			},
 			"postprocess": update_item,
-			"condition": lambda doc: (doc.base_amount == 0 or abs(doc.billed_amt) < abs(doc.amount))
+			"condition": lambda doc: (
+				doc.base_amount == 0
+				or abs(doc.billed_amt) < abs(doc.amount)
+				or doc.qty > flt(get_billed_qty(doc.name))
+			)
 			and select_item(doc),
 		},
 		"Purchase Taxes and Charges": {"doctype": "Purchase Taxes and Charges", "reset_value": True},
@@ -885,7 +947,7 @@ def get_list_context(context=None):
 
 @frappe.whitelist()
 def update_status(status, name):
-	po = frappe.get_lazy_doc("Purchase Order", name)
+	po = frappe.get_lazy_doc("Purchase Order", name, check_permission="submit")
 	po.update_status(status)
 	po.update_delivered_qty_in_sales_order()
 

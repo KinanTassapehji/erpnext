@@ -33,6 +33,7 @@ from erpnext.accounts.utils import (
 	get_account_currency,
 	update_voucher_outstanding,
 )
+from erpnext.assets.doctype.asset.asset import split_asset
 from erpnext.assets.doctype.asset.depreciation import (
 	depreciate_asset,
 	get_gl_entries_on_asset_disposal,
@@ -118,7 +119,7 @@ class SalesInvoice(SellingController):
 		cost_center: DF.Link | None
 		coupon_code: DF.Link | None
 		currency: DF.Link
-		customer: DF.Link | None
+		customer: DF.Link
 		customer_address: DF.Link | None
 		customer_group: DF.Link | None
 		customer_name: DF.SmallText | None
@@ -224,6 +225,7 @@ class SalesInvoice(SellingController):
 		terms: DF.TextEditor | None
 		territory: DF.Link | None
 		timesheets: DF.Table[SalesInvoiceTimesheet]
+		title: DF.Data | None
 		to_date: DF.Date | None
 		total: DF.Currency
 		total_advance: DF.Currency
@@ -479,6 +481,8 @@ class SalesInvoice(SellingController):
 			self.validate_standalone_serial_nos_customer()
 			self.update_stock_reservation_entries()
 			self.update_stock_ledger()
+
+		self.split_asset_based_on_sale_qty()
 
 		self.process_asset_depreciation()
 
@@ -916,11 +920,9 @@ class SalesInvoice(SellingController):
 		if self.pos_profile:
 			pos = frappe.get_doc("POS Profile", self.pos_profile)
 
-		if not self.get("payments") and not for_validate:
-			update_multi_mode_option(self, pos)
-
 		if pos:
 			if not for_validate:
+				update_multi_mode_option(self, pos)
 				self.tax_category = pos.get("tax_category")
 
 			if not for_validate and not self.customer:
@@ -1099,9 +1101,6 @@ class SalesInvoice(SellingController):
 				self.remarks = _("Against Customer Order {0}").format(self.po_no)
 				if self.po_date:
 					self.remarks += " " + _("dated {0}").format(formatdate(self.po_date))
-
-			else:
-				self.remarks = _("No Remarks")
 
 	def validate_auto_set_posting_time(self):
 		# Don't auto set the posting date and time if invoice is amended
@@ -1402,7 +1401,55 @@ class SalesInvoice(SellingController):
 			):
 				throw(_("Delivery Note {0} is not submitted").format(d.delivery_note))
 
+	def split_asset_based_on_sale_qty(self):
+		asset_qty_map = self.get_asset_qty()
+		for asset, qty in asset_qty_map.items():
+			if qty["actual_qty"] < qty["sale_qty"]:
+				frappe.throw(
+					_(
+						"Sell quantity cannot exceed the asset quantity. Asset {0} has only {1} item(s)."
+					).format(asset, qty["actual_qty"])
+				)
+
+			remaining_qty = qty["actual_qty"] - qty["sale_qty"]
+			if remaining_qty > 0:
+				split_asset(asset, remaining_qty)
+
+	def get_asset_qty(self):
+		asset_qty_map = {}
+
+		assets = {row.asset for row in self.items if row.is_fixed_asset and row.asset}
+		if not assets or self.is_return:
+			return asset_qty_map
+
+		asset_actual_qty = dict(
+			frappe.db.get_all(
+				"Asset",
+				{"name": ["in", list(assets)]},
+				["name", "asset_quantity"],
+				as_list=True,
+			)
+		)
+		for row in self.items:
+			if row.is_fixed_asset and row.asset:
+				actual_qty = asset_actual_qty.get(row.asset)
+				if row.asset in asset_qty_map.keys():
+					asset_qty_map[row.asset]["sale_qty"] += flt(row.qty)
+				else:
+					asset_qty_map.setdefault(
+						row.asset,
+						{
+							"sale_qty": flt(row.qty),
+							"actual_qty": flt(actual_qty),
+						},
+					)
+
+		return asset_qty_map
+
 	def process_asset_depreciation(self):
+		if self.is_internal_transfer():
+			return
+
 		if (self.is_return and self.docstatus == 2) or (not self.is_return and self.docstatus == 1):
 			self.depreciate_asset_on_sale()
 		else:
@@ -2728,7 +2775,7 @@ def make_inter_company_transaction(doctype, source_name, target_doc=None):
 				"doctype": target_doctype,
 				"postprocess": update_details,
 				"set_target_warehouse": "set_from_warehouse",
-				"field_no_map": ["taxes_and_charges", "set_warehouse", "shipping_address"],
+				"field_no_map": ["taxes_and_charges", "set_warehouse", "shipping_address", "cost_center"],
 			},
 			doctype + " Item": item_field_map,
 		},
@@ -2957,6 +3004,8 @@ def update_multi_mode_option(doc, pos_profile):
 		payment.account = payment_mode.default_account
 		payment.type = payment_mode.type
 
+	mop_refetched = bool(doc.payments) and not doc.is_created_using_pos
+
 	doc.set("payments", [])
 	invalid_modes = []
 	mode_of_payments = [d.mode_of_payment for d in pos_profile.get("payments")]
@@ -2977,6 +3026,12 @@ def update_multi_mode_option(doc, pos_profile):
 		else:
 			msg = _("Please set default Cash or Bank account in Mode of Payments {}")
 		frappe.throw(msg.format(", ".join(invalid_modes)), title=_("Missing Account"))
+
+	if mop_refetched:
+		frappe.toast(
+			_("Payment methods refreshed. Please review before proceeding."),
+			indicator="orange",
+		)
 
 
 def get_all_mode_of_payments(doc):

@@ -62,8 +62,6 @@ welcome_email = "erpnext.setup.utils.welcome_email"
 # setup wizard
 setup_wizard_requires = "assets/erpnext/js/setup_wizard.js"
 setup_wizard_stages = "erpnext.setup.setup_wizard.setup_wizard.get_setup_stages"
-setup_wizard_complete = "erpnext.setup.setup_wizard.setup_wizard.setup_demo"
-setup_wizard_test = "erpnext.setup.setup_wizard.test_setup_wizard.run_setup_wizard_test"
 
 after_install = "erpnext.setup.install.after_install"
 
@@ -219,6 +217,17 @@ website_route_rules = [
 	{"from_route": "/tasks", "to_route": "Task"},
 ]
 
+standard_navbar_items = [
+	{
+		"item_label": "Delete Demo Data",
+		"item_type": "Action",
+		"action": "erpnext.demo.clear_demo();",
+		"is_standard": 1,
+		"condition": "eval: frappe.boot.sysdefaults.demo_company && frappe.boot.sysdefaults.demo_company.length > 0",
+		"icon": "trash",
+	},
+]
+
 standard_portal_menu_items = [
 	{"title": "Projects", "route": "/project", "reference_doctype": "Project", "role": "Customer"},
 	{
@@ -270,7 +279,7 @@ standard_portal_menu_items = [
 		"role": "Customer",
 	},
 	{"title": "Issues", "route": "/issues", "reference_doctype": "Issue", "role": "Customer"},
-	{"title": "Addresses", "route": "/addresses", "reference_doctype": "Address"},
+	{"title": "Addresses", "route": "/addresses", "reference_doctype": "Address", "role": "Customer"},
 	{
 		"title": "Timesheets",
 		"route": "/timesheets",
@@ -308,8 +317,6 @@ has_website_permission = {
 	"Timesheet": "erpnext.controllers.website_list_for_contact.has_website_permission",
 	"Project": "erpnext.controllers.website_list_for_contact.has_website_permission",
 }
-
-before_tests = "erpnext.setup.utils.before_tests"
 
 
 period_closing_doctypes = [
@@ -574,6 +581,8 @@ accounting_dimension_doctypes = [
 	"Advance Taxes and Charges",
 ]
 
+subscription_doctypes = ["Sales Invoice", "Purchase Invoice", "Payment Request", "POS Invoice"]
+
 get_matching_queries = (
 	"erpnext.accounts.doctype.bank_reconciliation_tool.bank_reconciliation_tool.get_matching_queries"
 )
@@ -685,3 +694,10 @@ fields_for_group_similar_items = ["qty", "amount"]
 # ------------
 # List of apps whose translatable strings should be excluded from this app's translations.
 ignore_translatable_strings_from = ["frappe"]
+repost_allowed_doctypes = [
+	"Sales Invoice",
+	"Purchase Invoice",
+	"Journal Entry",
+	"Payment Entry",
+	"Purchase Receipt",
+]

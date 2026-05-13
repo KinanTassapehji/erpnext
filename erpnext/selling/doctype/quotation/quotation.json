@@ -22,6 +22,8 @@
   "company",
   "has_unit_price_items",
   "amended_from",
+  "section_break_jdzz",
+  "title",
   "currency_and_price_list",
   "currency",
   "conversion_rate",
@@ -109,7 +111,7 @@
   "tc_name",
   "terms",
   "more_info_tab",
-  "subscription_section",
+  "auto_repeat_section",
   "auto_repeat",
   "update_auto_repeat_reference",
   "print_settings",
@@ -123,19 +125,20 @@
   "competitors",
   "column_break_117",
   "order_lost_reason",
+  "utm_analytics_section",
+  "utm_source",
+  "utm_medium",
+  "column_break_fozg",
+  "utm_campaign",
+  "utm_content",
   "additional_info_section",
   "status",
   "customer_group",
   "territory",
   "column_break_108",
-  "utm_source",
-  "utm_campaign",
-  "utm_medium",
-  "utm_content",
-  "column_break4",
   "opportunity",
-  "supplier_quotation",
   "enq_det",
+  "supplier_quotation",
   "connections_tab"
  ],
  "fields": [
@@ -212,6 +215,7 @@
   {
    "fieldname": "company",
    "fieldtype": "Link",
+   "in_list_view": 1,
    "label": "Company",
    "oldfieldname": "company",
    "oldfieldtype": "Link",
@@ -831,11 +835,6 @@
    "read_only": 1
   },
   {
-   "fieldname": "subscription_section",
-   "fieldtype": "Section Break",
-   "label": "Auto Repeat"
-  },
-  {
    "fieldname": "auto_repeat",
    "fieldtype": "Link",
    "label": "Auto Repeat",
@@ -861,13 +860,6 @@
    "oldfieldname": "order_lost_reason",
    "oldfieldtype": "Small Text",
    "print_hide": 1
-  },
-  {
-   "fieldname": "column_break4",
-   "fieldtype": "Column Break",
-   "oldfieldtype": "Column Break",
-   "print_hide": 1,
-   "width": "50%"
   },
   {
    "default": "Draft",
@@ -1117,13 +1109,40 @@
    "no_copy": 1,
    "options": "Item Wise Tax Detail",
    "print_hide": 1
+  },
+  {
+   "fieldname": "column_break_fozg",
+   "fieldtype": "Column Break"
+  },
+  {
+   "collapsible": 1,
+   "fieldname": "utm_analytics_section",
+   "fieldtype": "Section Break",
+   "label": "UTM Analytics"
+  },
+  {
+   "fieldname": "auto_repeat_section",
+   "fieldtype": "Section Break",
+   "label": "Auto Repeat"
+  },
+  {
+   "fieldname": "section_break_jdzz",
+   "fieldtype": "Section Break"
+  },
+  {
+   "allow_on_submit": 1,
+   "fieldname": "title",
+   "fieldtype": "Data",
+   "label": "Title",
+   "no_copy": 1,
+   "print_hide": 1
   }
  ],
  "icon": "fa fa-shopping-cart",
  "idx": 82,
  "is_submittable": 1,
  "links": [],
- "modified": "2026-01-29 21:18:48.836168",
+ "modified": "2026-04-28 06:28:13.103302",
  "modified_by": "Administrator",
  "module": "Selling",
  "name": "Quotation",

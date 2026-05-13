@@ -13,7 +13,7 @@ from frappe.model.document import Document
 from frappe.model.meta import get_field_precision
 from frappe.model.utils import get_fetch_values
 from frappe.query_builder.functions import IfNull, Sum
-from frappe.utils import add_days, add_months, cint, cstr, flt, getdate, parse_json
+from frappe.utils import add_days, add_months, cint, cstr, flt, get_link_to_form, getdate, parse_json
 
 import erpnext
 from erpnext import get_company_currency
@@ -40,6 +40,8 @@ purchase_doctypes = [
 	"Purchase Receipt",
 	"Purchase Invoice",
 ]
+
+NOT_APPLICABLE_TAX = "N/A"
 
 
 def _preprocess_ctx(ctx):
@@ -724,16 +726,24 @@ def get_item_tax_template(ctx, item=None, out: ItemDetails | None = None):
 		item_tax_template = _get_item_tax_template(ctx, item.taxes, out)
 
 	if not item_tax_template:
-		item_group = item.item_group
-		while item_group and not item_tax_template:
-			item_group_doc = frappe.get_cached_doc("Item Group", item_group)
-			item_tax_template = _get_item_tax_template(ctx, item_group_doc.taxes, out)
-			item_group = item_group_doc.parent_item_group
+		item_tax_template = _get_item_tax_template_from_item_group(ctx, item.item_group, out)
 
 	if out and ctx.get("child_doctype") and item_tax_template:
 		out.update(get_fetch_values(ctx.get("child_doctype"), "item_tax_template", item_tax_template))
 
 	return item_tax_template
+
+
+def _get_item_tax_template_from_item_group(ctx, item_group, out=None):
+	from frappe.utils.nestedset import get_ancestors_of
+
+	ancestors = get_ancestors_of("Item Group", item_group)
+	for group in [item_group, *ancestors]:
+		group_doc = frappe.get_cached_doc("Item Group", group)
+		item_tax_template = _get_item_tax_template(ctx, group_doc.taxes, out)
+		if item_tax_template:
+			return item_tax_template
+	return None
 
 
 @erpnext.normalize_ctx_input(ItemDetailsCtx)
@@ -836,7 +846,10 @@ def get_item_tax_map(*, doc: str | dict | Document, tax_template: str | None = N
 		template = frappe.get_cached_doc("Item Tax Template", tax_template)
 		for d in template.taxes:
 			if frappe.get_cached_value("Account", d.tax_type, "company") == doc.get("company"):
-				item_tax_map[d.tax_type] = d.tax_rate
+				if d.get("not_applicable"):
+					item_tax_map[d.tax_type] = NOT_APPLICABLE_TAX
+				else:
+					item_tax_map[d.tax_type] = d.tax_rate
 
 	return json.dumps(item_tax_map) if as_json else item_tax_map
 
@@ -1055,16 +1068,30 @@ def insert_item_price(ctx: ItemDetailsCtx):
 	):
 		return
 
-	item_price = frappe.db.get_value(
+	transaction_date = (
+		getdate(ctx.get("posting_date") or ctx.get("transaction_date") or ctx.get("posting_datetime"))
+		or getdate()
+	)
+
+	item_prices = frappe.get_all(
 		"Item Price",
-		{
+		filters={
 			"item_code": ctx.item_code,
 			"price_list": ctx.price_list,
 			"currency": ctx.currency,
 			"uom": ctx.stock_uom,
 		},
-		["name", "price_list_rate"],
-		as_dict=1,
+		fields=["name", "price_list_rate", "valid_from", "valid_upto"],
+		order_by="valid_from desc, creation desc",
+	)
+	item_price = next(
+		(
+			row
+			for row in item_prices
+			if (not row.valid_from or getdate(row.valid_from) <= transaction_date)
+			and (not row.valid_upto or getdate(row.valid_upto) >= transaction_date)
+		),
+		item_prices[0] if item_prices else None,
 	)
 
 	update_based_on_price_list_rate = stock_settings.update_price_list_based_on == "Price List Rate"
@@ -1079,11 +1106,34 @@ def insert_item_price(ctx: ItemDetailsCtx):
 		if not price_list_rate or item_price.price_list_rate == price_list_rate:
 			return
 
-		frappe.db.set_value("Item Price", item_price.name, "price_list_rate", price_list_rate)
-		frappe.msgprint(
-			_("Item Price updated for {0} in Price List {1}").format(ctx.item_code, ctx.price_list),
-			alert=True,
-		)
+		is_price_valid_for_transaction = (
+			not item_price.valid_from or getdate(item_price.valid_from) <= transaction_date
+		) and (not item_price.valid_upto or getdate(item_price.valid_upto) >= transaction_date)
+		if is_price_valid_for_transaction:
+			frappe.db.set_value("Item Price", item_price.name, "price_list_rate", price_list_rate)
+			frappe.msgprint(
+				_("Item Price updated for {0} in Price List {1}").format(ctx.item_code, ctx.price_list),
+				alert=True,
+			)
+		else:
+			# if price is not valid for the transaction date, insert a new price list rate with updated price and future validity
+
+			item_price = frappe.new_doc(
+				"Item Price",
+				item_code=ctx.item_code,
+				price_list_rate=price_list_rate,
+				currency=ctx.currency,
+				uom=ctx.stock_uom,
+				price_list=ctx.price_list,
+				valid_from=transaction_date,
+			)
+			item_price.insert()
+			frappe.msgprint(
+				_("Item Price Added for {0} in Price List {1}").format(
+					get_link_to_form("Item", ctx.item_code), ctx.price_list
+				),
+				alert=True,
+			)
 	else:
 		rate_to_consider = (
 			(flt(ctx.price_list_rate) or flt(ctx.rate)) if update_based_on_price_list_rate else flt(ctx.rate)
@@ -1098,12 +1148,14 @@ def insert_item_price(ctx: ItemDetailsCtx):
 				"currency": ctx.currency,
 				"price_list_rate": price_list_rate,
 				"uom": ctx.stock_uom,
+				"valid_from": transaction_date,
 			}
 		)
 		item_price.insert()
 		frappe.msgprint(
-			_("Item Price added for {0} in Price List {1}").format(ctx.item_code, ctx.price_list),
-			alert=True,
+			_("Item Price added for {0} in Price List {1}").format(
+				get_link_to_form("Item", ctx.item_code), ctx.price_list
+			)
 		)
 
 

@@ -1065,8 +1065,12 @@ class PaymentEntry(AccountsController):
 				total_allocated_amount += flt(d.allocated_amount)
 				base_total_allocated_amount += self.calculate_base_allocated_amount_for_reference(d)
 
-		self.total_allocated_amount = abs(total_allocated_amount)
-		self.base_total_allocated_amount = abs(base_total_allocated_amount)
+		self.total_allocated_amount = flt(
+			abs(total_allocated_amount), self.precision("total_allocated_amount")
+		)
+		self.base_total_allocated_amount = flt(
+			abs(base_total_allocated_amount), self.precision("base_total_allocated_amount")
+		)
 
 	def set_unallocated_amount(self):
 		self.unallocated_amount = 0
@@ -1082,20 +1086,32 @@ class PaymentEntry(AccountsController):
 			self.base_paid_amount + deductions_to_consider
 		):
 			self.unallocated_amount = (
-				self.base_paid_amount
-				+ deductions_to_consider
-				- self.base_total_allocated_amount
-				- included_taxes
-			) / self.source_exchange_rate
+				flt(
+					(
+						self.base_paid_amount
+						+ deductions_to_consider
+						- self.base_total_allocated_amount
+						- included_taxes
+					),
+					self.precision("unallocated_amount"),
+				)
+				/ self.source_exchange_rate
+			)
 		elif self.payment_type == "Pay" and self.base_total_allocated_amount < (
 			self.base_received_amount - deductions_to_consider
 		):
 			self.unallocated_amount = (
-				self.base_received_amount
-				- deductions_to_consider
-				- self.base_total_allocated_amount
-				- included_taxes
-			) / self.target_exchange_rate
+				flt(
+					(
+						self.base_received_amount
+						- deductions_to_consider
+						- self.base_total_allocated_amount
+						- included_taxes
+					),
+					self.precision("unallocated_amount"),
+				)
+				/ self.target_exchange_rate
+			)
 
 	def set_exchange_gain_loss(self):
 		exchange_gain_loss = flt(
@@ -2290,22 +2306,20 @@ def get_outstanding_reference_documents(args, validate=False):
 	# Get positive outstanding sales /purchase invoices
 	condition = ""
 	if args.get("voucher_type") and args.get("voucher_no"):
-		condition = " and voucher_type={} and voucher_no={}".format(
-			frappe.db.escape(args["voucher_type"]), frappe.db.escape(args["voucher_no"])
-		)
+		condition = f" and voucher_type={frappe.db.escape(args['voucher_type'])} and voucher_no={frappe.db.escape(args['voucher_no'])}"
 		common_filter.append(ple.voucher_type == args["voucher_type"])
 		common_filter.append(ple.voucher_no == args["voucher_no"])
 
 	# Add cost center condition
 	if args.get("cost_center"):
-		condition += " and cost_center='%s'" % args.get("cost_center")
+		condition += f" and cost_center={frappe.db.escape(args.get('cost_center'))}"
 		accounting_dimensions_filter.append(ple.cost_center == args.get("cost_center"))
 
 	# dynamic dimension filters
 	active_dimensions = get_dimensions()[0]
 	for dim in active_dimensions:
 		if args.get(dim.fieldname):
-			condition += f" and {dim.fieldname}='{args.get(dim.fieldname)}'"
+			condition += f" and {dim.fieldname}={frappe.db.escape(args.get(dim.fieldname))}"
 			accounting_dimensions_filter.append(ple[dim.fieldname] == args.get(dim.fieldname))
 
 	date_fields_dict = {
@@ -2314,18 +2328,19 @@ def get_outstanding_reference_documents(args, validate=False):
 	}
 
 	for fieldname, date_fields in date_fields_dict.items():
+		from_date = frappe.db.escape(str(args.get(date_fields[0]))) if args.get(date_fields[0]) else None
+		to_date = frappe.db.escape(str(args.get(date_fields[1]))) if args.get(date_fields[1]) else None
+
 		if args.get(date_fields[0]) and args.get(date_fields[1]):
-			condition += " and {} between '{}' and '{}'".format(
-				fieldname, args.get(date_fields[0]), args.get(date_fields[1])
-			)
+			condition += f" and {fieldname} between {from_date} and {to_date}"
 			posting_and_due_date.append(ple[fieldname][args.get(date_fields[0]) : args.get(date_fields[1])])
 		elif args.get(date_fields[0]):
 			# if only from date is supplied
-			condition += f" and {fieldname} >= '{args.get(date_fields[0])}'"
+			condition += f" and {fieldname} >= {from_date}"
 			posting_and_due_date.append(ple[fieldname].gte(args.get(date_fields[0])))
 		elif args.get(date_fields[1]):
 			# if only to date is supplied
-			condition += f" and {fieldname} <= '{args.get(date_fields[1])}'"
+			condition += f" and {fieldname} <= {to_date}"
 			posting_and_due_date.append(ple[fieldname].lte(args.get(date_fields[1])))
 
 	if args.get("company"):
@@ -2360,9 +2375,7 @@ def get_outstanding_reference_documents(args, validate=False):
 			vouchers=args.get("vouchers") or None,
 		)
 
-		outstanding_invoices = split_invoices_based_on_payment_terms(
-			outstanding_invoices, args.get("company")
-		)
+		outstanding_invoices = split_refdocs_based_on_payment_terms(outstanding_invoices, args.get("company"))
 
 		for d in outstanding_invoices:
 			d["exchange_rate"] = 1
@@ -2400,6 +2413,8 @@ def get_outstanding_reference_documents(args, validate=False):
 			filters=args,
 		)
 
+		orders_to_be_billed = split_refdocs_based_on_payment_terms(orders_to_be_billed, args.get("company"))
+
 	data = negative_outstanding_invoices + outstanding_invoices + orders_to_be_billed
 
 	if not data:
@@ -2422,13 +2437,13 @@ def get_outstanding_reference_documents(args, validate=False):
 	return data
 
 
-def split_invoices_based_on_payment_terms(outstanding_invoices, company) -> list:
+def split_refdocs_based_on_payment_terms(refdocs, company) -> list:
 	"""Split a list of invoices based on their payment terms."""
-	exc_rates = get_currency_data(outstanding_invoices, company)
+	exc_rates = get_currency_data(refdocs, company)
 
-	outstanding_invoices_after_split = []
-	for entry in outstanding_invoices:
-		if entry.voucher_type in ["Sales Invoice", "Purchase Invoice"]:
+	outstanding_refdoc_after_split = []
+	for entry in refdocs:
+		if entry.voucher_type in ["Sales Invoice", "Purchase Invoice", "Sales Order", "Purchase Order"]:
 			if payment_term_template := frappe.db.get_value(
 				entry.voucher_type, entry.voucher_no, "payment_terms_template"
 			):
@@ -2443,25 +2458,25 @@ def split_invoices_based_on_payment_terms(outstanding_invoices, company) -> list
 						),
 						alert=True,
 					)
-				outstanding_invoices_after_split += split_rows
+				outstanding_refdoc_after_split += split_rows
 				continue
 
 		# If not an invoice or no payment terms template, add as it is
-		outstanding_invoices_after_split.append(entry)
+		outstanding_refdoc_after_split.append(entry)
 
-	return outstanding_invoices_after_split
+	return outstanding_refdoc_after_split
 
 
-def get_currency_data(outstanding_invoices: list, company: str | None = None) -> dict:
+def get_currency_data(outstanding_refdocs: list, company: str | None = None) -> dict:
 	"""Get currency and conversion data for a list of invoices."""
 	exc_rates = frappe._dict()
 	company_currency = frappe.db.get_value("Company", company, "default_currency") if company else None
 
-	for doctype in ["Sales Invoice", "Purchase Invoice"]:
-		invoices = [x.voucher_no for x in outstanding_invoices if x.voucher_type == doctype]
+	for doctype in ["Sales Invoice", "Purchase Invoice", "Sales Order", "Purchase Order"]:
+		refdoc = [x.voucher_no for x in outstanding_refdocs if x.voucher_type == doctype]
 		for x in frappe.db.get_all(
 			doctype,
-			filters={"name": ["in", invoices]},
+			filters={"name": ["in", refdoc]},
 			fields=["name", "currency", "conversion_rate", "party_account_currency"],
 		):
 			exc_rates[x.name] = frappe._dict(
@@ -2540,17 +2555,12 @@ def get_orders_to_be_billed(
 	if not voucher_type:
 		return []
 
-	# Add cost center condition
-	doc = frappe.get_doc({"doctype": voucher_type})
-	condition = ""
-	if doc and hasattr(doc, "cost_center") and doc.cost_center:
-		condition = " and cost_center='%s'" % cost_center
-
 	# dynamic dimension filters
-	active_dimensions = get_dimensions()[0]
+	condition = ""
+	active_dimensions = get_dimensions(True)[0]
 	for dim in active_dimensions:
 		if filters.get(dim.fieldname):
-			condition += f" and {dim.fieldname}='{filters.get(dim.fieldname)}'"
+			condition += f" and {dim.fieldname}={frappe.db.escape(filters.get(dim.fieldname))}"
 
 	if party_account_currency == company_currency:
 		grand_total_field = "base_grand_total"
